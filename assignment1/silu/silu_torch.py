@@ -1,7 +1,7 @@
 import torch
 from torch.profiler import profile, record_function, ProfilerActivity
 
-def silu_activation(x):
+def silu_activation(x: torch.Tensor)-> torch.Tensor:
     return x * (1.0 / (1.0 + torch.exp(-x)))
 
 if __name__ == "__main__":
