@@ -1,8 +1,8 @@
-*.nsys-rep
+# *.nsys-rep
 ./cse599/*
 trace.json
 *.out
-*.ncu-rep
+# *.ncu-rep
 *_demo/
 *Demo/
 *demo*/
