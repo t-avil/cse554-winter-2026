@@ -29,6 +29,6 @@ else:
 elapsed_sec = start.elapsed_time(end) / 1000
 
 print(f"Triton SiLU kernel time: {elapsed_sec:.6f} seconds")
-print("Bandwidth: ", 3 * input_tensor.element_size() * input_tensor.numel() / elapsed_sec / 1e9, "GB/s")
+print("Bandwidth: ", 2 * input_tensor.element_size() * input_tensor.numel() / elapsed_sec / 1e9, "GB/s")
 
 

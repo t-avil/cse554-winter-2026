@@ -22,4 +22,11 @@ torch.cuda.synchronize()
 
 
 print(result.cpu())
-print("time", start.elapsed_time(end))
+
+elapsed_sec = start.elapsed_time(end) / 1000
+
+print(f"Triton SiLU kernel time: {elapsed_sec:.6f} seconds")
+print("Bandwidth: ", 2 * local_matrix.element_size() * local_matrix.numel() / elapsed_sec / 1e9, "GB/s")
+
+
+
