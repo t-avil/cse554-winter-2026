@@ -36,9 +36,9 @@ int main() {
         for (int i = 0; i < num_iterations; ++i) {
             
             if (HOST_TO_DEVICE) {
-                cudaMemcpyAsync(data_device, PINNED_MEMORY ? data_host2 : data_host, copy_size_bytes, cudaMemcpyHostToDevice);
+                cudaMemcpy(data_device, PINNED_MEMORY ? data_host2 : data_host, copy_size_bytes, cudaMemcpyHostToDevice);
             } else {
-                cudaMemcpyAsync(PINNED_MEMORY ? data_host2 : data_host, data_device, copy_size_bytes, cudaMemcpyDeviceToHost);
+                cudaMemcpy(PINNED_MEMORY ? data_host2 : data_host, data_device, copy_size_bytes, cudaMemcpyDeviceToHost);
             }
 
         }
