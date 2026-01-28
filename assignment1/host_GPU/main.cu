@@ -14,7 +14,20 @@ int main() {
     float* device_data;
     cudaMalloc((void**)&device_data, ROWS * sizeof(float));
 
-    copy_first_column(host_data, device_data, ROWS, COLUMNS);
+    cudaEvent_t start, end;
+    cudaEventCreate(&start);
+    cudaEventCreate(&end);
+
+    cudaEventRecord(start);
+    cudaEventSynchronize(start);
+    for (int t = 0; t < 1000; ++t) {
+        copy_first_column(host_data, device_data, ROWS, COLUMNS);
+    }
+    cudaEventRecord(end);
+    cudaEventSynchronize(end);
+    float duration;
+    cudaEventElapsedTime(&duration, start, end);
+    std::cout << "Time: " << ((double)duration / (double)1000 * (double)1000) << " µs" << std::endl;
 
     float host_verify_data[ROWS];
     cudaMemcpy(host_verify_data, device_data, ROWS * sizeof(float), cudaMemcpyDeviceToHost);
