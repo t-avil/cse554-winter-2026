@@ -106,14 +106,14 @@ class Engine:
     def generate(self, input_string, rounds=20):
         input_ids = self.tokenizer.encode(input_string)
 
-        print("Token IDs:", input_ids)
+        # print("Token IDs:", input_ids)
         output_ids = input_ids.copy()
 
         new_token = self.run(output_ids)
         output_ids.append(new_token)
 
         for round in range(rounds - 1):
-            print(f"Round {round}")
+            # print(f"Round {round}")
             new_token = self.run(output_ids, prefill=True)
             output_ids.append(new_token)
 
