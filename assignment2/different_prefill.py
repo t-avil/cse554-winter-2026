@@ -3,7 +3,7 @@ import torch
 from transformers import AutoTokenizer
 import sys
 sys.path.append("../")  # Adjust the path to import the helper module
-from helper import WeightManager, apply_rope, extract_model_weights
+from helper import WeightManager, apply_rope, extract_model_weights, apply_rope_vectorized
 
 
 class Engine:
@@ -72,11 +72,8 @@ class Engine:
             q = x.matmul(self.weights["self_attn_q_proj_weight"][current_layer].t()) # (N, CT, D2)
             
             # Apply RoPE to query and key using the helper function
-            for i in range(N):
-                apply_rope(q[i], output=q[i], head_dim=self.head_dim, offset=self.kv_cache_lengths[i])
-                apply_rope(k[i], output=k[i], head_dim=self.head_dim, offset=self.kv_cache_lengths[i])
-            q[lengths_mask] = 0
-            k[lengths_mask] = 0
+            apply_rope_vectorized(q, output=q, head_dim=self.head_dim, offset=self.kv_cache_lengths)
+            apply_rope_vectorized(k, output=k, head_dim=self.head_dim, offset=self.kv_cache_lengths)
             
             scale = 1.0 / (self.head_dim ** 0.5)
             group_size = self.num_qo_heads // self.num_kv_heads
