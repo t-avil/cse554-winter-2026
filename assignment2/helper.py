@@ -126,6 +126,54 @@ def apply_rope(x: torch.Tensor, output: torch.Tensor, head_dim: int, offset: int
     # Restore original shape and copy into output
     output.copy_(x_rotated.transpose(1, 2).reshape(seq_len, -1).to(dtype=dtype))
 
+def apply_rope_vectorized(x: torch.Tensor, output: torch.Tensor, head_dim: int, offset: torch.Tensor) -> None:
+    """
+    Applies RoPE (Rotary Positional Embedding) to the input tensor.
+    
+    RoPE adds position-dependent rotations to the tensor.
+    
+    Args:
+        x (torch.Tensor): Input tensor with shape [seq_len, head_dim].
+        output (torch.Tensor): Tensor to store the result (same shape as x).
+        head_dim (int): Dimensionality of each attention head.
+        offset (int): Positional offset.
+    """
+    N, T, _ = x.shape  # (N, T, D)
+    device = x.device
+    dtype = x.dtype
+
+    # Create positions: shape [seq_len]
+    positions = offset.unsqueeze(1) + torch.arange(T, device=device, dtype=dtype) # (N, T)
+    positions = positions.reshape(N * T) # (N * T)
+
+    base = 500000.0
+    # Compute inverse frequency: shape [head_dim/2]
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.int64)
+                                 .float().to(device) / head_dim))
+    
+    # Expand dimensions for broadcasting:
+    inv_freq_expanded = inv_freq[None, :, None].float().expand(1, -1, 1) # (1, head_dim/2, 1)
+    position_ids_expanded = positions[None, None, :].float() # (1, 1, N * T)
+    
+    # Compute frequency embeddings
+    with torch.autocast(device_type=device.type, enabled=False):
+        freqs = (inv_freq_expanded @ position_ids_expanded).transpose(1, 2) # (1, N * T, head_dim/2)
+        # Duplicate frequencies for cos and sin parts:
+        emb = torch.cat((freqs, freqs), dim=-1) # (1, N * T, head_dim)
+        cos = emb.cos() # (1, N * T, head_dim)
+        sin = emb.sin() # (1, N * T, head_dim)
+    
+    # Reshape for multi-head compatibility:
+    cos = cos.reshape(N, 1, T, head_dim)  # [N, 1, T, head_dim]
+    sin = sin.reshape(N, 1, T, head_dim)  # [N, 1, T, head_dim]
+
+    # Reshape x for applying RoPE:
+    x = x.reshape(N, T, -1, head_dim).transpose(1, 2) # (N, D/head_dim, T, head_dim)
+    # Apply RoPE rotation
+    x_rotated = x * cos + rotate_half(x) * sin # (N, D/head_dim, T, head_dim)
+    # Restore original shape and copy into output
+    output.copy_(x_rotated.transpose(1, 2).reshape(N, T, -1).to(dtype=dtype))
+
 ########################################
 # Model Weight Extraction
 ########################################

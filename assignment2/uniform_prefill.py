@@ -2,7 +2,7 @@ import torch
 from transformers import AutoTokenizer
 import sys
 sys.path.append("../")  # Adjust the path to import the helper module
-from helper import WeightManager, apply_rope, extract_model_weights
+from helper import WeightManager, apply_rope, extract_model_weights, apply_rope_vectorized
 
 
 class Engine:
@@ -39,7 +39,95 @@ class Engine:
         ########################################
         # Complete this function
         ########################################
-        pass
+        input_tensor = torch.tensor(input_ids, dtype=torch.int32, device='cuda') # (N, CT)
+        N, CT = input_ids.shape
+        hidden_state = self.weights["embedding"][input_tensor] # (N, CT, D)
+        D = hidden_state.shape[-1]
+        D2 = self.weights["self_attn_k_proj_weight"][0].shape[0]
+        
+        if prefill:
+            # clear kv cache
+            self.kv_cache = {}
+            offset = 0
+        else:
+            # get offset from kv cache for rope
+            offset = self.kv_cache[0][0].shape[0] # previous length
+        
+        for current_layer in range(self.layers):
+            # --- Self-Attention Block ---
+            rms = torch.sqrt(torch.mean(hidden_state ** 2, dim=-1, keepdim=True) + 1e-5) # (N, CT, 1)
+            normalized_x = hidden_state / rms # (N, CT, D)
+            x = normalized_x.to(torch.float16) * self.weights["layernormAttn_weight"][current_layer] # (N, CT, D)
+            
+            k = x.matmul(self.weights["self_attn_k_proj_weight"][current_layer].t()) # (N, CT, D2)
+            v = x.matmul(self.weights["self_attn_v_proj_weight"][current_layer].t()) # (N, CT, D2)
+            q = x.matmul(self.weights["self_attn_q_proj_weight"][current_layer].t()) # (N, CT, D2)
+            
+            # Apply RoPE to query and key using the helper function
+            apply_rope_vectorized(q, output=q, head_dim=self.head_dim, offset=torch.full((N,), offset, device='cuda'))
+            apply_rope_vectorized(k, output=k, head_dim=self.head_dim, offset=torch.full((N,), offset, device='cuda'))
+            
+            scale = 1.0 / (self.head_dim ** 0.5)
+            group_size = self.num_qo_heads // self.num_kv_heads
+            
+            sub_q = q.view(N, CT, self.num_qo_heads, self.head_dim).permute(1, 0, 2, 3) # (CT, N, self.num_qo_heads, self.head_dim)
+            sub_k = k.view(N, CT, self.num_kv_heads, self.head_dim).permute(1, 0, 2, 3) # (CT, N, self.num_kv_heads, self.head_dim)
+            sub_v = v.view(N, CT, self.num_kv_heads, self.head_dim).permute(1, 0, 2, 3) # (CT, N, self.num_kv_heads, self.head_dim)
+
+            # use kv cache to get full kv
+            if not prefill:
+                sub_k = torch.cat([self.kv_cache[current_layer][0], sub_k], dim=0) # (offset + CT, N, self.num_kv_heads, self.head_dim)
+                sub_v = torch.cat([self.kv_cache[current_layer][1], sub_v], dim=0) # (offset + CT, N, self.num_kv_heads, self.head_dim)
+            
+            self.kv_cache[current_layer] = (sub_k, sub_v)
+            
+            n_q = sub_q.shape[0] # CT
+            n_k = sub_k.shape[0] # offset + CT
+            assert n_q == CT
+            assert n_k == offset + CT
+
+            sub_k = sub_k.repeat_interleave(group_size, dim=-2) # (offset + CT, N, self.num_qo_heads, self.head_dim)
+            sub_v = sub_v.repeat_interleave(group_size, dim=-2) # (offset + CT, N, self.num_qo_heads, self.head_dim)
+            
+            sub_q_t = sub_q.permute(1, 2, 0, 3) # (N, self.num_qo_heads, CT, self.head_dim)
+            sub_k_t = sub_k.permute(1, 2, 0, 3) # (N, self.num_qo_heads, offset + CT, self.head_dim)
+
+            scores = torch.matmul(sub_q_t, sub_k_t.transpose(-2, -1)) * scale # (N, self.num_qo_heads, CT, offset + CT)
+
+            if prefill:
+                mask = torch.ones((n_q, n_k), dtype=torch.bool, device='cuda').triu(diagonal=1) # (CT, offset + CT)
+                scores = scores.masked_fill(mask, float('-inf')) # valid because if prefill, offset = 0.
+            # For non-prefill, we only care about the last token's score, so no mask needed
+            
+            attn_weights = torch.softmax(scores, dim=-1) # (N, self.num_qo_heads, CT, offset + CT)
+
+            v_t = sub_v.permute(1, 2, 0, 3) # (N, self.num_qo_heads, offset + CT, self.head_dim)
+            attn_output = torch.matmul(attn_weights, v_t) # (N, self.num_qo_heads, CT, self.head_dim)
+
+            attn_output = attn_output.permute(0, 2, 1, 3) # (N, CT, self.num_qo_heads, self.head_dim)
+            attn_output = attn_output.reshape(N, n_q, self.num_qo_heads * self.head_dim) # (N, CT, self.num_qo_heads * self.head_dim) = (N, CT, D)
+
+            attn_output = attn_output.matmul(self.weights["o_proj_weight"][current_layer].t()) + hidden_state # (N, CT, D)
+
+            # --- Feed-Forward Network (FFN) Block ---
+            rms = torch.sqrt(torch.mean(attn_output ** 2, dim=-1, keepdim=True) + 1e-5) # (N, CT, 1)
+            normalized_x = attn_output / rms # (N, CT, D)
+            layernormFFN_output = normalized_x.to(torch.float16) * self.weights["layernormFFN_weight"][current_layer]
+            
+            up_proj_output = layernormFFN_output.matmul(self.weights["up_proj_weight"][current_layer].t())
+            gate_proj_output = layernormFFN_output.matmul(self.weights["gate_proj_weight"][current_layer].t())
+            
+            activation_output = up_proj_output * torch.nn.functional.silu(gate_proj_output)
+            hidden_state = activation_output.matmul(self.weights["down_proj_weight"][current_layer].t()) + attn_output
+
+        # --- Final Layer Normalization and Output Projection ---
+        rms = torch.sqrt(torch.mean(hidden_state ** 2, dim=-1, keepdim=True) + 1e-5)
+        normalized_x = hidden_state / rms
+        model_output = normalized_x.to(torch.float16) * self.weights["model_layernorm_weight"]
+        logits = model_output.matmul(self.weights["lm_head_weight"].t())
+        
+        sample_output = torch.argmax(logits, dim=-1)
+        return sample_output[:, -1:].clone().to(device='cpu')
     
     def generate_batched(self, input_string, rounds=20):
         input_ids_list = self.tokenizer(input_string, return_tensors="pt", padding=False).input_ids
