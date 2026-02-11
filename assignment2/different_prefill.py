@@ -35,12 +35,119 @@ class Engine:
         self.weights = extract_model_weights(weight_manager.weight_map, self.layers)
         
         self.kv_cache = {}
+        self.kv_cache_lengths = None
     
     def run(self, input_ids, prefill = True):
         ########################################
         # Complete this function
         ########################################
-        pass
+        N = len(input_ids)
+        lengths = torch.tensor([len(ids) for ids in input_ids], device='cuda')
+        CT = lengths.max()
+        if prefill:
+            input_tensor = torch.zeros(N, CT, dtype=input_ids[0].dtype, device='cuda')
+            for i in range(N):
+                input_tensor[i, :lengths[i]] = input_ids[i]
+            self.kv_cache_lengths = torch.zeros(N, dtype=torch.int64, device='cuda')
+            self.kv_cache = {}
+        else:
+            assert self.kv_cache_lengths is not None
+            input_tensor = torch.tensor(input_ids).reshape(N, CT)
+        hidden_state = self.weights["embedding"][input_tensor] # (N, CT, D)
+        D = hidden_state.shape[-1]
+        D2 = self.weights["self_attn_k_proj_weight"][0].shape[0]
+        PT = self.kv_cache_lengths.max()
+
+        lengths_mask = torch.arange(CT, device='cuda').repeat(N, 1) >= lengths.unsqueeze(1) # (N, CT)
+        hidden_state[lengths_mask] = 0
+
+        for current_layer in range(self.layers):
+            # --- Self-Attention Block ---
+            rms = torch.sqrt(torch.mean(hidden_state ** 2, dim=-1, keepdim=True) + 1e-5) # (N, CT, 1)
+            normalized_x = hidden_state / rms # (N, CT, D)
+            x = normalized_x.to(torch.float16) * self.weights["layernormAttn_weight"][current_layer] # (N, CT, D)
+            
+            k = x.matmul(self.weights["self_attn_k_proj_weight"][current_layer].t()) # (N, CT, D2)
+            v = x.matmul(self.weights["self_attn_v_proj_weight"][current_layer].t()) # (N, CT, D2)
+            q = x.matmul(self.weights["self_attn_q_proj_weight"][current_layer].t()) # (N, CT, D2)
+            
+            # Apply RoPE to query and key using the helper function
+            for i in range(N):
+                apply_rope(q[i], output=q[i], head_dim=self.head_dim, offset=self.kv_cache_lengths[i])
+                apply_rope(k[i], output=k[i], head_dim=self.head_dim, offset=self.kv_cache_lengths[i])
+            q[lengths_mask] = 0
+            k[lengths_mask] = 0
+            
+            scale = 1.0 / (self.head_dim ** 0.5)
+            group_size = self.num_qo_heads // self.num_kv_heads
+            
+            sub_q = q.view(N, CT, self.num_qo_heads, self.head_dim).permute(1, 0, 2, 3) # (CT, N, self.num_qo_heads, self.head_dim)
+            sub_k = k.view(N, CT, self.num_kv_heads, self.head_dim).permute(1, 0, 2, 3) # (CT, N, self.num_kv_heads, self.head_dim)
+            sub_v = v.view(N, CT, self.num_kv_heads, self.head_dim).permute(1, 0, 2, 3) # (CT, N, self.num_kv_heads, self.head_dim)
+
+            # use kv cache to get full kv
+            if not prefill:
+                sub_k_new = torch.cat([self.kv_cache[current_layer][0], torch.zeros(CT, N, self.num_kv_heads, self.head_dim, dtype=sub_k.dtype, device=sub_k.device)], dim=0) # (offset + CT, N, self.num_kv_heads, self.head_dim)
+                sub_v_new = torch.cat([self.kv_cache[current_layer][1], torch.zeros(CT, N, self.num_kv_heads, self.head_dim, dtype=sub_v.dtype, device=sub_v.device)], dim=0) # (offset + CT, N, self.num_kv_heads, self.head_dim)
+                sub_k_new[self.kv_cache_lengths, torch.arange(N)] = sub_k.squeeze(0)
+                sub_v_new[self.kv_cache_lengths, torch.arange(N)] = sub_v.squeeze(0)
+                sub_k = sub_k_new
+                sub_v = sub_v_new
+            
+            self.kv_cache[current_layer] = (sub_k, sub_v)
+            
+            n_q = sub_q.shape[0] # CT
+            n_k = sub_k.shape[0] # PT + CT
+            assert n_q == CT
+            assert n_k == PT + CT
+
+            sub_k = sub_k.repeat_interleave(group_size, dim=-2) # (PT + CT, N, self.num_qo_heads, self.head_dim)
+            sub_v = sub_v.repeat_interleave(group_size, dim=-2) # (PT + CT, N, self.num_qo_heads, self.head_dim)
+            
+            sub_q_t = sub_q.permute(1, 2, 0, 3) # (N, self.num_qo_heads, CT, self.head_dim)
+            sub_k_t = sub_k.permute(1, 2, 0, 3) # (N, self.num_qo_heads, PT + CT, self.head_dim)
+
+            scores = torch.matmul(sub_q_t, sub_k_t.transpose(-2, -1)) * scale # (N, self.num_qo_heads, CT, PT + CT)
+
+            if prefill:
+                mask = torch.ones((n_q, n_k), dtype=torch.bool, device='cuda').triu(diagonal=1) # (CT, PT + CT)
+                scores = scores.masked_fill(mask, float('-inf')) # valid because if prefill, offset = 0.
+                # we don't mask out the scores because we mask it out at attn_output.
+            else:
+                attn_weights_mask = torch.arange(PT + CT, device='cuda').repeat(CT, 1) >= (self.kv_cache_lengths + lengths).unsqueeze(1) # (N, CT)
+                scores = scores.masked_fill(attn_weights_mask.unsqueeze(1).unsqueeze(2), float('-inf'))
+            
+            attn_weights = torch.softmax(scores, dim=-1) # (N, self.num_qo_heads, CT, PT + CT)
+
+            v_t = sub_v.permute(1, 2, 0, 3) # (N, self.num_qo_heads, PT + CT, self.head_dim)
+            attn_output = torch.matmul(attn_weights, v_t) # (N, self.num_qo_heads, CT, self.head_dim)
+            attn_output = attn_output.masked_fill(lengths_mask.unsqueeze(1).unsqueeze(3), 0)
+
+            attn_output = attn_output.permute(0, 2, 1, 3) # (N, CT, self.num_qo_heads, self.head_dim)
+            attn_output = attn_output.reshape(N, n_q, self.num_qo_heads * self.head_dim) # (N, CT, self.num_qo_heads * self.head_dim) = (N, CT, D)
+
+            attn_output = attn_output.matmul(self.weights["o_proj_weight"][current_layer].t()) + hidden_state # (N, CT, D)
+
+            # --- Feed-Forward Network (FFN) Block ---
+            rms = torch.sqrt(torch.mean(attn_output ** 2, dim=-1, keepdim=True) + 1e-5) # (N, CT, 1)
+            normalized_x = attn_output / rms # (N, CT, D)
+            layernormFFN_output = normalized_x.to(torch.float16) * self.weights["layernormFFN_weight"][current_layer]
+            
+            up_proj_output = layernormFFN_output.matmul(self.weights["up_proj_weight"][current_layer].t())
+            gate_proj_output = layernormFFN_output.matmul(self.weights["gate_proj_weight"][current_layer].t())
+            
+            activation_output = up_proj_output * torch.nn.functional.silu(gate_proj_output)
+            hidden_state = activation_output.matmul(self.weights["down_proj_weight"][current_layer].t()) + attn_output
+
+        # --- Final Layer Normalization and Output Projection ---
+        rms = torch.sqrt(torch.mean(hidden_state ** 2, dim=-1, keepdim=True) + 1e-5)
+        normalized_x = hidden_state / rms
+        model_output = normalized_x.to(torch.float16) * self.weights["model_layernorm_weight"]
+        logits = model_output.matmul(self.weights["lm_head_weight"].t())
+        
+        self.kv_cache_lengths += lengths
+        sample_output = torch.argmax(logits, dim=-1)
+        return sample_output[torch.arange(N), lengths - 1].clone().to(device='cpu')
     
     def generate_batched(self, input_string, rounds=20):
         input_ids_list = []
