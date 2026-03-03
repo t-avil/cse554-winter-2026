@@ -131,10 +131,10 @@ def build_kv_metadata(kvs: List[DistKVCache]):
     kv_last_page_len: List[int] = []
 
     for kv in kvs:
-        pass
-        #########
-        # FIXME #
-        #########
+        kv_indices.extend(kv.indices)
+        
+        kv_last_page_len.append(kv.last_page_offset)
+        kv_indptr.append(len(kv.indices) + kv_indptr[-1])
 
     device = "cuda"
     return (
@@ -249,21 +249,25 @@ class Engine:
             # ----------------------------------------------------------------
             # 2) Create KV cache for prefill requests in kv_cache_map
             # ----------------------------------------------------------------
-            
-            #########
-            # FIXME #
-            #########
-                
-            seq_lens_before: List[int] = []
+            for req in requests:
+                if req.request_id not in self.kv_cache_map:
+                    self.kv_cache_map[req.request_id] = DistKVCache(self.pool)
+
+            seq_lens_before = [self.kv_cache_map[req.request_id].seqlen for req in requests]
             seq_lens_before_t = torch.tensor(seq_lens_before, dtype=torch.int32, device="cuda")
 
             # ----------------------------------------------------------------
             # 3) Reserve allocate pages for all requests if needed using allocate_tokens function
             # ----------------------------------------------------------------
             
-            #########
-            # FIXME #
-            #########
+            for idx, req in enumerate(requests):
+                if idx < num_decode_req:
+                    # decode
+                    self.kv_cache_map[req.request_id].allocate_tokens(1)
+                else:
+                    # prefill
+                    self.kv_cache_map[req.request_id].allocate_tokens(req.prompt_length)
+                
             
             seq_lens_after = [self.kv_cache_map[r.request_id].seqlen for r in requests]
             seq_lens_after_t = torch.tensor(seq_lens_after, dtype=torch.int32, device="cuda")
@@ -278,16 +282,26 @@ class Engine:
             # ----------------------------------------------------------------
             if not len(requests) - num_decode_req == 0:
                 # plan prefill wrapper
-                pass
-                #########
-                # FIXME #
-                #########
+                self.prefill_wrapper.plan(
+                    indptr_tensor[num_decode_req:],
+                    kv_indptr[num_decode_req:],
+                    kv_indices,
+                    kv_last_page_len,
+                    self.num_qo_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    self.page_size
+                )
             if num_decode_req > 0:
-                # plan decode wrapper
-                pass
-                #########
-                # FIXME #
-                #########
+                self.decode_wrapper.plan(
+                    kv_indptr[:num_decode_req+1],
+                    kv_indices,
+                    kv_last_page_len,
+                    self.num_qo_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    self.page_size
+                )
 
             # ----------------------------------------------------------------
             # 5) Forward pass through all *transformer* layers
@@ -319,29 +333,45 @@ class Engine:
                 # Use flashinfer.apply_rope_inplace
                 # apply ROPE, Note the the theta is set to 500_000.0 and offsets should be the current sequence length before allocate new tokens
                 
-                #########
-                # FIXME #
-                #########
+                flashinfer.apply_rope_inplace(q, k, indptr_tensor, offsets=seq_lens_before_t, rope_theta=500_000.0)
 
                 # ---- Append new tokens to *paged* KV-cache ------------------
                 # Use flashinfer.get_batch_indices_positions and flashinfer.append_paged_kv_cache
                 # if you use get_batch_indices_positions, seq_lens should be the length after the allocation
 
-                #########
-                # FIXME #
-                #########
+                # batch_indices, positions = flashinfer.get_batch_indices_positions(
+                #     kv_indptr, kv_last_page_len, input_tensor.shape[0]
+                # )
+
+                batch_indices, positions = flashinfer.get_batch_indices_positions(
+                    indptr_tensor,     
+                    seq_lens_after_t,  
+                    input_tensor.shape[0]
+                )
+                paged_kv_cache = (self.pool.k_datas[layer], self.pool.v_datas[layer])
+                
+                flashinfer.append_paged_kv_cache(
+                    k, v, batch_indices, positions, paged_kv_cache, kv_indices, kv_indptr, kv_last_page_len, kv_layout="HND"
+                )
+
 
                 # ---- Attention itself --------------------------------------
                 # run prefill and decode wrappers. Note that for the prefill wrapper, if qo_indptr does not start with 0, first qo_indptr[0] rows of the output tensor will be empty
-                attn_out = None
-                #########
-                # FIXME #
-                #########
+                attn_out = torch.empty((input_tensor.shape[0], self.num_qo_heads, self.head_dim), 
+                       dtype=torch.float16, device="cuda")
                 
-                # aggregate the decode and prefill outputs
-                #########
-                # FIXME #
-                #########
+                if num_decode_req != 0:
+                    attn_out[:num_decode_req] = self.decode_wrapper.run(
+                        q[:num_decode_req], paged_kv_cache
+                    )
+
+                if len(requests) > num_decode_req:
+                    attn_out[indptr_tensor[num_decode_req]:] = self.prefill_wrapper.run(
+                        q[indptr_tensor[num_decode_req]:], paged_kv_cache
+                    )
+
+                
+                attn_out = attn_out.view(-1, self.num_qo_heads * self.head_dim)
                 
                 # Residual connection
                 hidden = attn_out.matmul(self.weights["o_proj_weight"][layer].T) + hidden
@@ -433,4 +463,4 @@ if __name__ == "__main__":
     generated_texts = engine.generate_batched(sample_prompts, rounds=30)
 
     for idx, text in enumerate(generated_texts):
-        print(f"[request {idx:02d}] {text}\n")
+        print(f"[request {(1+ idx):02d}] {text}\n")
