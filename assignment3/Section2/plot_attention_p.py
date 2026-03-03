@@ -1,5 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import torch
+import flashinfer
 
 #Reference config for each model
 llama3_1b_config = {
@@ -23,19 +25,74 @@ llama3_8b_config = {
 # Sequence lengths (powers of 2)
 p_llama3 = 2 ** np.arange(7, 16)   # 2^7 to 2^15
 
-# Fake TFLOPs data generator
-def fake_tflops(seq_lens, model_factor):
-    return np.log2(seq_lens) * model_factor + np.random.normal(0, 0.5, size=len(seq_lens))
+
+def measure_tflops_sdpa(seq_len, config, bs):
+    if seq_len >= 16384:
+        return float('nan')
+    d_h = config['hidden_size'] // config['num_attention_heads']
+    h_qo = config['num_attention_heads']
+    h_kv = config['num_key_value_heads']
+    gen = torch.Generator(device='cuda')
+    gen.manual_seed(42)
+    q = torch.randn(bs, h_qo, seq_len, d_h, dtype=torch.float16, device='cuda', generator=gen)
+    k = torch.randn(bs, h_kv, seq_len, d_h, dtype=torch.float16, device='cuda', generator=gen)
+    v = torch.randn(bs, h_kv, seq_len, d_h, dtype=torch.float16, device='cuda', generator=gen)
+
+    num_iters = 10
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(num_iters):
+        o = torch.nn.functional.scaled_dot_product_attention(q, k, v, enable_gqa=True)
+    end.record()
+    torch.cuda.synchronize()
+    elapsed_time = start.elapsed_time(end) / 1000 / num_iters
+
+    total_flop = 4 * h_qo * seq_len * seq_len * d_h
+    tflops = total_flop / elapsed_time / 1e12
+    return tflops
+
+
+def measure_tflops_flashinfer(seq_len, config):
+    d_h = config['hidden_size'] // config['num_attention_heads']
+    h_qo = config['num_attention_heads']
+    h_kv = config['num_key_value_heads']
+    gen = torch.Generator(device='cuda')
+    gen.manual_seed(42)
+    q = torch.randn(1, h_qo, seq_len, d_h, dtype=torch.float16, device='cuda', generator=gen)
+    k = torch.randn(1, h_kv, seq_len, d_h, dtype=torch.float16, device='cuda', generator=gen)
+    v = torch.randn(1, h_kv, seq_len, d_h, dtype=torch.float16, device='cuda', generator=gen)
+    q = q[0].transpose(0, 1)
+    k = k[0].transpose(0, 1)
+    v = v[0].transpose(0, 1)
+
+    num_iters = 10
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(num_iters):
+        o = flashinfer.single_prefill_with_kv_cache(q, k, v)
+        o = o.transpose(0, 1).reshape(1, h_qo, seq_len, d_h)
+    end.record()
+    torch.cuda.synchronize()
+    elapsed_time = start.elapsed_time(end) / 1000 / num_iters
+
+    total_flop = 4 * h_qo * seq_len * seq_len * d_h
+    tflops = total_flop / elapsed_time / 1e12
+    return tflops
+
 
 # Generate fake compute utilization data
-llama3_1b_sdpa = fake_tflops(p_llama3, 2.0)
-llama3_1b_flashinfer = fake_tflops(p_llama3, 2.2)
+llama3_1b_sdpa = [measure_tflops_sdpa(seq_len, llama3_1b_config, 1) for seq_len in p_llama3]
+llama3_1b_flashinfer = [measure_tflops_flashinfer(seq_len, llama3_1b_config) for seq_len in p_llama3]
 
-llama3_3b_sdpa = fake_tflops(p_llama3, 2.5)
-llama3_3b_flashinfer = fake_tflops(p_llama3, 2.8)
+llama3_3b_sdpa = [measure_tflops_sdpa(seq_len, llama3_3b_config, 1) for seq_len in p_llama3]
+llama3_3b_flashinfer = [measure_tflops_flashinfer(seq_len, llama3_3b_config) for seq_len in p_llama3]
 
-llama3_8b_sdpa = fake_tflops(p_llama3, 3.5)
-llama3_8b_flashinfer = fake_tflops(p_llama3, 3.9)
+llama3_8b_sdpa = [measure_tflops_sdpa(seq_len, llama3_8b_config, 1) for seq_len in p_llama3]
+llama3_8b_flashinfer = [measure_tflops_flashinfer(seq_len, llama3_8b_config) for seq_len in p_llama3]
 
 # Plotting setup
 fig, axs = plt.subplots(1, 3, figsize=(18, 5), sharey=True)
@@ -75,7 +132,11 @@ axs[2].set_xticklabels([str(p) for p in p_llama3])
 axs[2].legend()
 axs[2].grid(True, which='both')
 
+# for i in range(3):
+#     axs[i].set_yscale('log', base=2)
+
 # Overall figure title and layout
-fig.suptitle('Prefill Attention Compute Utilization (Fake Data)', fontsize=16)
+fig.suptitle('Prefill Attention Compute Utilization', fontsize=16)
 plt.tight_layout(rect=[0, 0, 1, 0.95])
-plt.savefig('attention_compute_utilization.png', dpi=300)
+plt.savefig('assignment3/Section2/viz/attention_compute_utilization2.png', dpi=300)
+
