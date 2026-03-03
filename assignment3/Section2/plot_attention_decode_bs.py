@@ -23,12 +23,14 @@ llama3_8b_config = {
 }
 
 # Sequence lengths (powers of 2)
-p_llama3 = 2 ** np.arange(7, 16)   # 2^7 to 2^15
+SEQ_LEN = 1024
+BATCH_SIZES = [2 ** x for x in range(7)]
 
 
 def measure_tflops_sdpa(seq_len, config, bs):
-    if seq_len >= 16384:
+    if config['hidden_size'] >= 4096 and bs >= 64:
         return float('nan')
+    print(bs)
     d_h = config['hidden_size'] // config['num_attention_heads']
     h_qo = config['num_attention_heads']
     h_kv = config['num_key_value_heads']
@@ -49,23 +51,24 @@ def measure_tflops_sdpa(seq_len, config, bs):
     torch.cuda.synchronize()
     elapsed_time = start.elapsed_time(end) / 1000 / num_iters
 
-    total_flop = 4 * h_qo * seq_len * seq_len * d_h
+    total_flop = 4 * h_qo * seq_len * seq_len * d_h * bs
     tflops = total_flop / elapsed_time / 1e12
     return tflops
 
 
-def measure_tflops_flashinfer(seq_len, config):
+def measure_tflops_flashinfer(seq_len, config, bs):
+    print(bs)
     d_h = config['hidden_size'] // config['num_attention_heads']
     h_qo = config['num_attention_heads']
     h_kv = config['num_key_value_heads']
     gen = torch.Generator(device='cuda')
     gen.manual_seed(42)
-    q = torch.randn(1, h_qo, seq_len, d_h, dtype=torch.float16, device='cuda', generator=gen)
-    k = torch.randn(1, h_kv, seq_len, d_h, dtype=torch.float16, device='cuda', generator=gen)
-    v = torch.randn(1, h_kv, seq_len, d_h, dtype=torch.float16, device='cuda', generator=gen)
-    q = q[0].transpose(0, 1)
-    k = k[0].transpose(0, 1)
-    v = v[0].transpose(0, 1)
+    q = torch.randn(bs, h_qo, seq_len, d_h, dtype=torch.float16, device='cuda', generator=gen)
+    k = torch.randn(bs, h_kv, seq_len, d_h, dtype=torch.float16, device='cuda', generator=gen)
+    v = torch.randn(bs, h_kv, seq_len, d_h, dtype=torch.float16, device='cuda', generator=gen)
+    q = q.reshape(bs * h_qo, seq_len, d_h).transpose(0, 1)
+    k = k.reshape(bs * h_kv, seq_len, d_h).transpose(0, 1)
+    v = v.reshape(bs * h_kv, seq_len, d_h).transpose(0, 1)
 
     num_iters = 10
     torch.cuda.synchronize()
@@ -74,61 +77,61 @@ def measure_tflops_flashinfer(seq_len, config):
     start.record()
     for _ in range(num_iters):
         o = flashinfer.single_prefill_with_kv_cache(q, k, v)
-        o = o.transpose(0, 1).reshape(1, h_qo, seq_len, d_h)
+        o = o.transpose(0, 1).reshape(bs, h_qo, seq_len, d_h)
     end.record()
     torch.cuda.synchronize()
     elapsed_time = start.elapsed_time(end) / 1000 / num_iters
 
-    total_flop = 4 * h_qo * seq_len * seq_len * d_h
+    total_flop = 4 * h_qo * seq_len * seq_len * d_h * bs
     tflops = total_flop / elapsed_time / 1e12
     return tflops
 
 
 # Generate fake compute utilization data
-llama3_1b_sdpa = [measure_tflops_sdpa(seq_len, llama3_1b_config, 1) for seq_len in p_llama3]
-llama3_1b_flashinfer = [measure_tflops_flashinfer(seq_len, llama3_1b_config) for seq_len in p_llama3]
+llama3_1b_sdpa = [measure_tflops_sdpa(SEQ_LEN, llama3_1b_config, bs) for bs in BATCH_SIZES]
+llama3_1b_flashinfer = [measure_tflops_flashinfer(SEQ_LEN, llama3_1b_config, bs) for bs in BATCH_SIZES]
 
-llama3_3b_sdpa = [measure_tflops_sdpa(seq_len, llama3_3b_config, 1) for seq_len in p_llama3]
-llama3_3b_flashinfer = [measure_tflops_flashinfer(seq_len, llama3_3b_config) for seq_len in p_llama3]
+llama3_3b_sdpa = [measure_tflops_sdpa(SEQ_LEN, llama3_3b_config, bs) for bs in BATCH_SIZES]
+llama3_3b_flashinfer = [measure_tflops_flashinfer(SEQ_LEN, llama3_3b_config, bs) for bs in BATCH_SIZES]
 
-llama3_8b_sdpa = [measure_tflops_sdpa(seq_len, llama3_8b_config, 1) for seq_len in p_llama3]
-llama3_8b_flashinfer = [measure_tflops_flashinfer(seq_len, llama3_8b_config) for seq_len in p_llama3]
+llama3_8b_sdpa = [measure_tflops_sdpa(SEQ_LEN, llama3_8b_config, bs) for bs in BATCH_SIZES]
+llama3_8b_flashinfer = [measure_tflops_flashinfer(SEQ_LEN, llama3_8b_config, bs) for bs in BATCH_SIZES]
 
 # Plotting setup
 fig, axs = plt.subplots(1, 3, figsize=(18, 5), sharey=True)
 models = ['LLaMA3-1B', 'LLaMA3-3B', 'LLaMA3-8B']
 
 # LLaMA2-7B plot
-axs[0].plot(p_llama3, llama3_1b_sdpa, label='PyTorch SDPA', marker='o')
-axs[0].plot(p_llama3, llama3_1b_flashinfer, label='FlashInfer', marker='x')
+axs[0].plot(BATCH_SIZES, llama3_1b_sdpa, label='PyTorch SDPA', marker='o')
+axs[0].plot(BATCH_SIZES, llama3_1b_flashinfer, label='FlashInfer', marker='x')
 axs[0].set_xscale('log', base=2)
 axs[0].set_title(models[0])
-axs[0].set_xlabel('p (sequence length)')
+axs[0].set_xlabel('Batch Size')
 axs[0].set_ylabel('Compute Utilization (TFLOPs)')
-axs[0].set_xticks(p_llama3)
-axs[0].set_xticklabels([str(p) for p in p_llama3])
+axs[0].set_xticks(BATCH_SIZES)
+axs[0].set_xticklabels([str(p) for p in BATCH_SIZES])
 axs[0].legend()
 axs[0].grid(True, which='both')
 
 # LLaMA3-8B plot
-axs[1].plot(p_llama3, llama3_3b_sdpa, label='PyTorch SDPA', marker='o')
-axs[1].plot(p_llama3, llama3_3b_flashinfer, label='FlashInfer', marker='x')
+axs[1].plot(BATCH_SIZES, llama3_3b_sdpa, label='PyTorch SDPA', marker='o')
+axs[1].plot(BATCH_SIZES, llama3_3b_flashinfer, label='FlashInfer', marker='x')
 axs[1].set_xscale('log', base=2)
 axs[1].set_title(models[1])
-axs[1].set_xlabel('p (sequence length)')
-axs[1].set_xticks(p_llama3)
-axs[1].set_xticklabels([str(p) for p in p_llama3])
+axs[1].set_xlabel('Batch Size')
+axs[1].set_xticks(BATCH_SIZES)
+axs[1].set_xticklabels([str(p) for p in BATCH_SIZES])
 axs[1].legend()
 axs[1].grid(True, which='both')
 
 # LLaMA3-70B plot
-axs[2].plot(p_llama3, llama3_8b_sdpa, label='PyTorch SDPA', marker='o')
-axs[2].plot(p_llama3, llama3_8b_flashinfer, label='FlashInfer', marker='x')
+axs[2].plot(BATCH_SIZES, llama3_8b_sdpa, label='PyTorch SDPA', marker='o')
+axs[2].plot(BATCH_SIZES, llama3_8b_flashinfer, label='FlashInfer', marker='x')
 axs[2].set_xscale('log', base=2)
 axs[2].set_title(models[2])
-axs[2].set_xlabel('p (sequence length)')
-axs[2].set_xticks(p_llama3)
-axs[2].set_xticklabels([str(p) for p in p_llama3])
+axs[2].set_xlabel('Batch Size')
+axs[2].set_xticks(BATCH_SIZES)
+axs[2].set_xticklabels([str(p) for p in BATCH_SIZES])
 axs[2].legend()
 axs[2].grid(True, which='both')
 
@@ -136,6 +139,6 @@ axs[2].grid(True, which='both')
 #     axs[i].set_yscale('log', base=2)
 
 # Overall figure title and layout
-fig.suptitle('Prefill Attention Compute Utilization', fontsize=16)
+fig.suptitle('Compute Utilization by Batch Size', fontsize=16)
 plt.tight_layout(rect=[0, 0, 1, 0.95])
-plt.savefig('assignment3/Section2/viz/attention_compute_utilization2.png', dpi=300)
+plt.savefig('assignment3/Section2/viz/attention_by_batch_size.png', dpi=300)
