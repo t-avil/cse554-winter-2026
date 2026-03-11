@@ -251,6 +251,8 @@ class Engine:
                     #########
                     # FIXME #
                     #########
+                    pieces.append(req.scheduling_pf_tokens)
+                    indptr.append(indptr[-1] + req.scheduling_pf_tokens.size(0))
 
             input_tensor = torch.cat(pieces).to("cuda")
             # print(f"batch size {len(input_tensor)}")
@@ -274,6 +276,8 @@ class Engine:
                 #########
                 # FIXME #
                 #########
+                tokens_to_add = 1 if idx < num_decode_req else req.scheduling_pf_tokens.size(0)
+                cache.allocate_tokens(tokens_to_add)
 
             seq_lens_after = [self.kv_cache_map[r.request_id].seqlen for r in requests]
             seq_lens_after_t = torch.tensor(seq_lens_after, dtype=torch.int32, device="cuda")
@@ -289,6 +293,29 @@ class Engine:
             #########
             # FIXME #
             #########
+            if not len(requests) - num_decode_req == 0:
+                pf_qo_indptr = indptr_tensor[num_decode_req:] - indptr_tensor[num_decode_req]
+                self.prefill_wrapper.plan(
+                    qo_indptr=pf_qo_indptr,
+                    paged_kv_indptr=kv_indptr[num_decode_req:],
+                    paged_kv_indices=kv_indices,
+                    paged_kv_last_page_len=kv_last_page_len[num_decode_req:],
+                    num_qo_heads=self.num_qo_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    head_dim_qk=self.head_dim,
+                    page_size=self.page_size,
+                )
+            if num_decode_req > 0:
+                self.decode_wrapper.plan(
+                    indptr=kv_indptr[:num_decode_req + 1],
+                    indices=kv_indices,
+                    last_page_len=kv_last_page_len[:num_decode_req],
+                    num_qo_heads=self.num_qo_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    head_dim=self.head_dim,
+                    page_size=self.page_size,
+                    data_type=torch.float16,
+                )
 
             # ----------------------------------------------------------------
             # 5) Forward pass through all *transformer* layers
@@ -352,6 +379,25 @@ class Engine:
                 #########
                 # FIXME #
                 #########
+                if not len(requests) - num_decode_req == 0:
+                    prefill_out = self.prefill_wrapper.run(
+                        q[num_decode_req:],
+                        (self.pool.k_datas[layer], self.pool.v_datas[layer]),
+                    )
+                
+                if num_decode_req > 0:
+                    decode_out = self.decode_wrapper.run(
+                        q[:num_decode_req],
+                        (self.pool.k_datas[layer], self.pool.v_datas[layer]),
+                    )
+                    if not len(requests) - num_decode_req == 0:
+                        attn_out = torch.cat([decode_out, prefill_out], dim=0)
+                    else:
+                        attn_out = decode_out
+                else:
+                    attn_out = prefill_out      
+                          
+                attn_out = attn_out.reshape(-1, self.num_qo_heads * self.head_dim)
                 
                 # Residual connection
                 hidden = attn_out.matmul(self.weights["o_proj_weight"][layer].T) + hidden

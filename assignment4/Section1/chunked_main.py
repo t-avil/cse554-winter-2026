@@ -1,3 +1,5 @@
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 from chunked_engine import Engine
 from chunked_scheduler import Scheduler, InputRequest
 import numpy as np
@@ -8,7 +10,7 @@ def sample_lognormal_ints(l, mean=6.0, sigma=0.7):
 
 
 engine = Engine()
-scheduler = Scheduler(engine, token_batch_size=1024)
+scheduler = Scheduler(engine, token_batch_size=512)
 
 sample_prompts = ["Today is a rainy day"] * 1024 + ["UW is"] * 1024
 
@@ -21,4 +23,4 @@ for prompt in sample_prompts:
 while not scheduler.finished():
     scheduler.run()
 
-# scheduler.print_completed()
+scheduler.print_completed()
