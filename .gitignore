@@ -11,3 +11,4 @@ trace.json
 *.DS_Store
 assignment3/Section1/cublas_gemm_profile
 .vscode/
+*.pyc

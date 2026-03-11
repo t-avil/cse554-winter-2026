@@ -202,16 +202,20 @@ class Engine:
         # Mapping: request-id -> DistKVCache
         self.kv_cache_map: Dict[int, DistKVCache] = {}
 
-        # FlashInfer workspace (single allocation for the whole run)
+        # FlashInfer workspaces - separate buffers for prefill vs decode
+        # so both can be plan()'d simultaneously without conflicts
         workspace_bytes = 128 << 20  # 128 MiB
-        self._fi_workspace = torch.empty(
+        self._fi_workspace_prefill = torch.empty(
+            workspace_bytes, dtype=torch.uint8, device="cuda"
+        )
+        self._fi_workspace_decode = torch.empty(
             workspace_bytes, dtype=torch.uint8, device="cuda"
         )
         self.prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-            self._fi_workspace, "HND"
+            self._fi_workspace_prefill, "HND"
         )
         self.decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-            self._fi_workspace, "HND", use_tensor_cores=True)
+            self._fi_workspace_decode, "HND", use_tensor_cores=True)
 
     # ---------------------------------------------------------------------
     #  One *step* (mixed prefill + decode) over an *arbitrary* request batch
@@ -276,15 +280,35 @@ class Engine:
             # 4) Plan FlashInfer execution for this micro-batch
             # ----------------------------------------------------------------
             if not len(requests) - num_decode_req == 0:
-                pass
                 #########
                 # FIXME #
                 #########
+                # Build qo_indptr for prefill requests only (offset by num_decode_req)
+                pf_qo_indptr = indptr_tensor[num_decode_req:] - indptr_tensor[num_decode_req]
+                self.prefill_wrapper.plan(
+                    qo_indptr=pf_qo_indptr,
+                    paged_kv_indptr=kv_indptr[num_decode_req:],
+                    paged_kv_indices=kv_indices,
+                    paged_kv_last_page_len=kv_last_page_len[num_decode_req:],
+                    num_qo_heads=self.num_qo_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    head_dim_qk=self.head_dim,
+                    page_size=self.page_size,
+                )
             if num_decode_req > 0:
-                pass
                 #########
                 # FIXME #
                 #########
+                self.decode_wrapper.plan(
+                    indptr=kv_indptr[:num_decode_req + 1],
+                    indices=kv_indices,
+                    last_page_len=kv_last_page_len[:num_decode_req],
+                    num_qo_heads=self.num_qo_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    head_dim=self.head_dim,
+                    page_size=self.page_size,
+                    data_type=torch.float16,
+                )
 
             # ----------------------------------------------------------------
             # 5) Forward pass through all *transformer* layers
@@ -349,12 +373,31 @@ class Engine:
                 #########
                 # FIXME #
                 #########
+                if not len(requests) - num_decode_req == 0:
+                    prefill_out = self.prefill_wrapper.run(
+                        q[num_decode_req:],
+                        (self.pool.k_datas[layer], self.pool.v_datas[layer]),
+                    )
                 
                 # aggregate the decode and prefill outputs
                 #########
                 # FIXME #
-                #########      
+                #########
+                if num_decode_req > 0:
+                    decode_out = self.decode_wrapper.run(
+                        q[:num_decode_req],
+                        (self.pool.k_datas[layer], self.pool.v_datas[layer]),
+                    )
+                    if not len(requests) - num_decode_req == 0:
+                        # prefill_out has NO empty rows
+                        attn_out = torch.cat([decode_out, prefill_out], dim=0)
+                    else:
+                        attn_out = decode_out
+                else:
+                    attn_out = prefill_out      
                           
+                # Reshape from (T, num_heads, head_dim) to (T, num_heads * head_dim)
+                attn_out = attn_out.reshape(-1, self.num_qo_heads * self.head_dim)
                 # Residual connection
                 hidden = attn_out.matmul(self.weights["o_proj_weight"][layer].T) + hidden
 

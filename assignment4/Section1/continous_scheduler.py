@@ -30,6 +30,15 @@ class Scheduler:
         #########
         # FIXME #
         #########
+        while self.pending_input_req and self.get_req_batch_size() < self.req_batch_size:
+            pending_req = self.pending_input_req.pop(0)
+            req_id = self.unique_req_id
+            self.unique_req_id += 1
+            prompt_ids = self.engine.tokenizer(
+                pending_req.input_str, return_tensors="pt"
+            ).input_ids[0]
+            req = Request(req_id, prompt_ids, pending_req.output_len)
+            self.scheduled_prefill_req.append(req)
 
         # Build the list of requests to send to the engine
         request_list_total = []
@@ -37,24 +46,43 @@ class Scheduler:
         #########
         # FIXME #
         #########
+        # Decode requests come first, then prefill requests
+        request_list_total = self.decode_req + self.scheduled_prefill_req
+        decode_num = len(self.decode_req)
         new_tokens = self.engine.run(request_list_total, decode_num)
 
         # Append newly generated tokens to each request's output buffer
         #########
         # FIXME #
         #########
+        for i, req in enumerate(request_list_total):
+            req.output_token_ids = torch.cat(
+                [req.output_token_ids, new_tokens[i:i+1]]
+            )
 
         # Check which decode requests have finished and remove from the queue
         ongoing_decode: list[Request] = []
         #########
         # FIXME #
         #########
+        for req in self.decode_req:
+            if req.current_length >= req.prompt_length + req.output_length:
+                self.completed.append(req)
+                # Release KV cache pages for finished request
+                if req.request_id in self.engine.kv_cache_map:
+                    self.engine.kv_cache_map[req.request_id].release()
+                    del self.engine.kv_cache_map[req.request_id]
+            else:
+                ongoing_decode.append(req)
         self.decode_req = ongoing_decode
 
         # Move scheduled prefill requests into decode queue
         #########
         # FIXME #
         #########
+        for req in self.scheduled_prefill_req:
+            self.decode_req.append(req)
+        self.scheduled_prefill_req = []
     
     def print_completed(self):
         for i, req in enumerate(self.completed):
