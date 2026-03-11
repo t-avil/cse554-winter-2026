@@ -202,20 +202,16 @@ class Engine:
         # Mapping: request-id -> DistKVCache
         self.kv_cache_map: Dict[int, DistKVCache] = {}
 
-        # FlashInfer workspaces - separate buffers for prefill vs decode
-        # so both can be plan()'d simultaneously without conflicts
+        # FlashInfer workspace (single allocation for the whole run)
         workspace_bytes = 128 << 20  # 128 MiB
-        self._fi_workspace_prefill = torch.empty(
-            workspace_bytes, dtype=torch.uint8, device="cuda"
-        )
-        self._fi_workspace_decode = torch.empty(
+        self._fi_workspace = torch.empty(
             workspace_bytes, dtype=torch.uint8, device="cuda"
         )
         self.prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-            self._fi_workspace_prefill, "HND"
+            self._fi_workspace, "HND"
         )
         self.decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-            self._fi_workspace_decode, "HND", use_tensor_cores=True)
+            self._fi_workspace, "HND", use_tensor_cores=True)
 
     # ---------------------------------------------------------------------
     #  One *step* (mixed prefill + decode) over an *arbitrary* request batch
