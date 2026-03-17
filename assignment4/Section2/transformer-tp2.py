@@ -57,10 +57,10 @@ model_layernorm_weight = weights["model_layernorm_weight"]
 lm_head_weight = weights["lm_head_weight"]
 
 # === Run One Iteration with Tensor Parallelism ===
-def run_one_iteration(input_ids, rank, world_size):
+def run_one_iteration(input_ids, rank, world_size, embedding_in_device):
     # Convert input token IDs to tensor and move to current device
     input_tensor = torch.tensor(input_ids, dtype=torch.int32, device=f"cuda:{rank}")
-    hidden_state = embedding.to(f'cuda:{rank}')[input_tensor]  # Embed input tokens
+    hidden_state = embedding_in_device[input_tensor]  # Embed input tokens
 
     # Define local dimensions for tensor parallelism
     local_q_heads = num_qo_heads // world_size
@@ -72,7 +72,7 @@ def run_one_iteration(input_ids, rank, world_size):
         # --- Attention Block ---
         rms = torch.sqrt(torch.mean(hidden_state ** 2, dim=-1, keepdim=True) + 1e-5)
         normalized_x = hidden_state / rms
-        x = normalized_x * layernormAttn_weight[layer]
+        x = normalized_x * layernormAttn_weight[layer] # (seq_len, hidden_dim)
         
         # --- Part 1 Implement the attention block ---
 
@@ -81,40 +81,49 @@ def run_one_iteration(input_ids, rank, world_size):
         # hint: use rank, local_q_heads, local_kv_heads, head_dim to figure out the correct slice
         # hint: to debug, compare the intermediate outputs with the original implementation in transformer-w3l1.py
         
-        # q = 
-        # k = 
-        # v = 
+        q_proj = self_attn_q_proj_weight[layer] # (num_qo_heads * head_dim, hidden_dim)
+        q_proj = q_proj[rank * local_q_heads * head_dim : (rank + 1) * local_q_heads * head_dim, :] # (local_q_heads * head_dim, hidden_dim)
+        k_proj = self_attn_k_proj_weight[layer] # (num_kv_heads * head_dim, hidden_dim)
+        k_proj = k_proj[rank * local_kv_heads * head_dim : (rank + 1) * local_kv_heads * head_dim, :] # (local_kv_heads * head_dim, hidden_dim)
+        v_proj = self_attn_v_proj_weight[layer] # (num_kv_heads * head_dim, hidden_dim)
+        v_proj = v_proj[rank * local_kv_heads * head_dim : (rank + 1) * local_kv_heads * head_dim, :] # (local_kv_heads * head_dim, hidden_dim)
+        q = x @ q_proj.t() # (seq_len, local_q_heads * head_dim)
+        k = x @ k_proj.t() # (seq_len, local_kv_heads * head_dim)
+        v = x @ v_proj.t() # (seq_len, local_kv_heads * head_dim)
 
         # Apply rotary position embeddings
         apply_rope(q, output=q, head_dim=head_dim, offset=0)
         apply_rope(k, output=k, head_dim=head_dim, offset=0)
 
         # Reshape into multi-head format and replicate KV for grouped attention
-        sub_q = q.view(-1, local_q_heads, head_dim)
-        sub_k = k.view(-1, local_kv_heads, head_dim).repeat_interleave(num_qo_heads // num_kv_heads, dim=1)
-        sub_v = v.view(-1, local_kv_heads, head_dim).repeat_interleave(num_qo_heads // num_kv_heads, dim=1)
+        sub_q = q.view(-1, local_q_heads, head_dim) # (seq_len, local_q_heads, head_dim)
+        sub_k = k.view(-1, local_kv_heads, head_dim).repeat_interleave(num_qo_heads // num_kv_heads, dim=1) # (seq_len, local_q_heads, head_dim)
+        sub_v = v.view(-1, local_kv_heads, head_dim).repeat_interleave(num_qo_heads // num_kv_heads, dim=1) # (seq_len, local_q_heads, head_dim)
 
         # Transpose for batch matmul in attention computation
-        sub_q_t = sub_q.permute(1, 0, 2)
-        sub_k_t = sub_k.permute(1, 0, 2)
-        scores = torch.matmul(sub_q_t, sub_k_t.transpose(-2, -1)) * (1.0 / (head_dim ** 0.5))
+        sub_q_t = sub_q.permute(1, 0, 2) # (local_q_heads, seq_len, head_dim)
+        sub_k_t = sub_k.permute(1, 0, 2) # (local_q_heads, seq_len, head_dim)
+        scores = torch.matmul(sub_q_t, sub_k_t.transpose(-2, -1)) * (1.0 / (head_dim ** 0.5)) # (local_q_heads, seq_len, seq_len)
 
         # Causal mask to prevent attending to future tokens
         causal_mask = torch.tril(torch.ones(scores.shape[-2:], dtype=torch.bool, device=scores.device))
-        scores = scores.masked_fill(~causal_mask.unsqueeze(0), float('-inf'))
-        attn_weights = torch.softmax(scores, dim=-1)
+        scores = scores.masked_fill(~causal_mask.unsqueeze(0), float('-inf')) # (local_q_heads, seq_len, seq_len)
+        attn_weights = torch.softmax(scores, dim=-1) # (local_q_heads, seq_len, seq_len)
 
         # Weighted sum of values
-        v_t = sub_v.permute(1, 0, 2)
-        attn_output = torch.matmul(attn_weights, v_t).permute(1, 0, 2).reshape(-1, local_q_heads * head_dim)
+        v_t = sub_v.permute(1, 0, 2) # (local_q_heads, seq_len, head_dim)
+        attn_output = torch.matmul(attn_weights, v_t).permute(1, 0, 2).reshape(-1, local_q_heads * head_dim) # (seq_len, local_q_heads * head_dim)
 
         # TODO: generate the o_proj_local vector
         # assuming that the weights of o_proj are split in a row-wise manner
         # hint: use rank, local_hidden_dim to figure out the correct slice
-        # o_proj_local = 
+        o_proj = o_proj_weight[layer] # (hidden_dim, num_qo_heads * head_dim)
+        o_proj = o_proj[:, rank * local_q_heads * head_dim : (rank + 1) * local_q_heads * head_dim] # (hidden_dim, local_q_heads * head_dim)
+        o_proj_local = attn_output @ o_proj.t() # (seq_len, hidden_dim)
         
         # TODO: perform the all-reduce operation
         # hint: use dist.all_reduce 
+        dist.all_reduce(o_proj_local, op=dist.ReduceOp.SUM)
         
         o_proj_residual = o_proj_local + hidden_state  # Add residual
 
@@ -127,17 +136,24 @@ def run_one_iteration(input_ids, rank, world_size):
         # TODO: generate the up_local and gate_local vectors
         # assuming that the weights of up_proj and gate_proj are split in a column-wise manner
         # hint: use rank, local_intermediate_dim to figure out the correct slice
-        # up_local = 
-        # gate_local = 
+        up_proj = up_proj_weight[layer].t() # (hidden_dim, intermediate_dim)
+        up_proj = up_proj[:, rank * local_intermediate_dim : (rank + 1) * local_intermediate_dim] # (hidden_dim, local_intermediate_dim)
+        gate_proj = gate_proj_weight[layer].t() # (hidden_dim, intermediate_dim)
+        gate_proj = gate_proj[:, rank * local_intermediate_dim : (rank + 1) * local_intermediate_dim] # (hidden_dim, local_intermediate_dim)
+        up_local = ffn_input @ up_proj # (seq_len, local_intermediate_dim)
+        gate_local = ffn_input @ gate_proj # (seq_len, local_intermediate_dim)
 
         # SwiGLU activation (SiLU * linear)
         activation_output = up_local * F.silu(gate_local)
 
         # TODO: generate the down_local vector
         # assuming that the weights of down_proj are split in a row-wise manner
-        # down_local = 
+        down_proj = down_proj_weight[layer].t() # (intermediate_dim, hidden_dim)
+        down_proj = down_proj[rank * local_intermediate_dim : (rank + 1) * local_intermediate_dim, :] # (local_intermediate_dim, hidden_dim)
+        down_local = activation_output @ down_proj # (seq_len, hidden_dim)
 
         # TODO: perform the all-reduce operation
+        dist.all_reduce(down_local, op=dist.ReduceOp.SUM)
 
         # Add residual
         hidden_state = down_local + o_proj_residual
@@ -157,8 +173,9 @@ def generate():
     input_string = "The University of Michigan is a"
     input_ids = tokenizer.encode(input_string)
     output_ids = input_ids.copy()
+    embedding_in_device = embedding.to(f'cuda:{rank}')
     for _ in range(100):
-        new_token = run_one_iteration(output_ids, rank, world_size)
+        new_token = run_one_iteration(output_ids, rank, world_size, embedding_in_device=embedding_in_device)
         output_ids.append(new_token)
     if rank == 0:
         print("\nOutput:", tokenizer.decode(output_ids, skip_special_tokens=True))
